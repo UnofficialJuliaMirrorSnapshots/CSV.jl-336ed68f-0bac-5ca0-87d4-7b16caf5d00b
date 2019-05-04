@@ -1,4 +1,4 @@
-using Test, CSV, Dates, Tables, WeakRefStrings, CategoricalArrays, DataFrames, PooledArrays
+using Test, CSV, Dates, Tables, DataFrames, CategoricalArrays, PooledArrays
 
 const dir = joinpath(dirname(pathof(CSV)), "../test/testfiles")
 
@@ -12,9 +12,14 @@ end
 
 @testset "CSV" begin
 
+@testset "CSV.File" begin
+
 include("basics.jl")
-include("files.jl")
+include("testfiles.jl")
 include("iteration.jl")
+
+end # @testset "CSV.File"
+
 include("write.jl")
 
 @testset "transform" begin
@@ -66,46 +71,47 @@ include("write.jl")
 end
 
 @testset "CategoricalArray levels (including ordering)" begin
-    f = CSV.read(IOBuffer("X\nb\nc\na\nc"), types=[CategoricalString{UInt32}])
+    f = CSV.read(IOBuffer("X\nb\nc\na\nc"), types=[CategoricalString{UInt32}], copycols=true)
     v = f.X[1]
     @test v == "b"
     @test levels(v.pool) == ["a", "b", "c"]
     
-    f = CSV.read(IOBuffer("X\nb\nc\na\nc"), categorical=true)
+    f = CSV.read(IOBuffer("X\nb\nc\na\nc"), categorical=true, copycols=true)
     v = f.X[1]
     @test v == "b"
     @test levels(v.pool) == ["a", "b", "c"]
 
-    f = CSV.read(IOBuffer("X\nb\nc\n\nc"), categorical=true)
+    f = CSV.read(IOBuffer("X\nb\nc\n\nc"), categorical=true, copycols=true)
     v = f.X[1]
     @test v == "b"
     @test levels(v.pool) == ["b", "c"]
     @test typeof(f.X) == CategoricalArray{Union{Missing, String},1,UInt32,String,CategoricalString{UInt32},Missing}
+
 end
 
 @testset "PooledArrays" begin
 
-df = CSV.read(IOBuffer("X\nb\nc\na\nc"), pool=true)
-@test typeof(df.X) == PooledArrays.PooledArray{String,UInt32,1,Array{UInt32,1}}
-@test size(df) == (4, 1)
-@test df.X == ["b", "c", "a", "c"]
-@test df.X.refs[2] == df.X.refs[4]
+    df = CSV.read(IOBuffer("X\nb\nc\na\nc"), pool=true, copycols=true)
+    @test typeof(df.X) == PooledArrays.PooledArray{String,UInt32,1,Array{UInt32,1}}
+    @test size(df) == (4, 1)
+    @test df.X == ["b", "c", "a", "c"]
+    @test df.X.refs[2] == df.X.refs[4]
 
-df = CSV.read(IOBuffer("X\nb\nc\na\nc"), pool=0.5)
-@test typeof(df.X) == PooledArrays.PooledArray{String,UInt32,1,Array{UInt32,1}}
-@test size(df) == (4, 1)
-@test df.X == ["b", "c", "a", "c"]
-@test df.X.refs[2] == df.X.refs[4]
+    df = CSV.read(IOBuffer("X\nb\nc\na\nc"), pool=0.5, copycols=true)
+    @test typeof(df.X) == PooledArrays.PooledArray{String,UInt32,1,Array{UInt32,1}}
+    @test size(df) == (4, 1)
+    @test df.X == ["b", "c", "a", "c"]
+    @test df.X.refs[2] == df.X.refs[4]
 
-df = CSV.read(IOBuffer("X\nb\nc\n\nc"), pool=true)
-@test typeof(df.X) == PooledArray{Union{Missing, String},UInt32,1,Array{UInt32,1}}
-@test size(df) == (4, 1)
-@test df.X[3] === missing
+    df = CSV.read(IOBuffer("X\nb\nc\n\nc"), pool=true, copycols=true)
+    @test typeof(df.X) == PooledArray{Union{Missing, String},UInt32,1,Array{UInt32,1}}
+    @test size(df) == (4, 1)
+    @test df.X[3] === missing
 
-df = CSV.read(IOBuffer("X\nc\nc\n\nc\nc\nc\nc"))
-@test typeof(df.X) == PooledArray{Union{Missing, String},UInt32,1,Array{UInt32,1}}
-@test size(df) == (7, 1)
-@test isequal(df.X, ["c", "c", missing, "c", "c", "c", "c"])
+    df = CSV.read(IOBuffer("X\nc\nc\n\nc\nc\nc\nc"), copycols=true)
+    @test typeof(df.X) == PooledArray{Union{Missing, String},UInt32,1,Array{UInt32,1}}
+    @test size(df) == (7, 1)
+    @test isequal(df.X, ["c", "c", missing, "c", "c", "c", "c"])
 
 end
 

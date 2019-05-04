@@ -1,186 +1,161 @@
 Tables.istable(::Type{<:File}) = true
 Tables.columnaccess(::Type{<:File}) = true
-Tables.schema(f::File)  = Tables.Schema(f.names, f.types)
+Tables.schema(f::File)  = Tables.Schema(getnames(f), _eltype.(gettypes(f)))
+Tables.columns(f::File) = f
+Base.propertynames(f::File) = getnames(f)
 
-# fieldindex maps a given column type to its corresponding typed array field in Column
-fieldindex(::Type{Missing}) = 3
-fieldindex(::Type{Int64}) = 4
-fieldindex(::Type{Float64}) = 5
-fieldindex(::Type{Date}) = 6
-fieldindex(::Type{DateTime}) = 7
-fieldindex(::Type{Bool}) = 8
-fieldindex(::Type{<:AbstractString}) = 0
-fieldindex(::Type{Union{T, Missing}}) where {T} = fieldindex(T) + 5
-
-# Column is a special container that only initializes an array of one type
-# in Tables.columns, it allows us to have a type-stable Vector{Column} for all columns
-# and then based on a column's typecode, we can access the internal typed array as needed
-mutable struct Column
-    offsets::Vector{UInt64}
-    lengths::Vector{UInt32}
-
-    missings::Vector{Missing}
-    ints::Vector{Int64}
-    floats::Vector{Float64}
-    dates::Vector{Date}
-    datetimes::Vector{DateTime}
-    bools::Vector{Bool}
-    
-    intsm::Vector{Union{Int64, Missing}}
-    floatsm::Vector{Union{Float64, Missing}}
-    datesm::Vector{Union{Date, Missing}}
-    datetimesm::Vector{Union{DateTime, Missing}}
-    boolsm::Vector{Union{Bool, Missing}}
-
-    Column(rows::Integer) = new(Vector{UInt64}(undef, rows), Vector{UInt32}(undef, rows))
-
-    function Column(A::AbstractVector{T}) where {T}
-        c = new()
-        setfield!(c, fieldindex(T), A)
-        return c
-    end
+struct Column{T, P} <: AbstractVector{T}
+    f::File
+    col::Int
+    r::StepRange{Int, Int}
 end
 
-function makecolumn(T, rows)
-    if T === EMPTY
-        A = Column(Missing[])
-    elseif T === MISSINGTYPE
-        A = Column(fill(missing, rows))
-    elseif T === STRING || T === (STRING | MISSING) ||
-           T === POOL || T === (POOL | MISSING)
-        A = Column(rows)
-    else
-        A = Column(Vector{TYPECODES[T]}(undef, rows))
+_eltype(::Type{T}) where {T} = T
+_eltype(::Type{PooledString}) = String
+_eltype(::Type{Union{PooledString, Missing}}) = Union{String, Missing}
+
+function Column(f::File, i::Int)
+    T = gettypes(f)[i]
+    r = range(2 + ((i - 1) * 2), step=getcols(f) * 2, length=getrows(f))
+    return Column{_eltype(T), T}(f, i, r)
+end
+
+Base.size(c::Column) = (length(c.r),)
+Base.IndexStyle(::Type{<:Column}) = Base.IndexLinear()
+
+function Base.copy(c::Column{T}) where {T}
+    len = length(c)
+    A = Vector{T}(undef, len)
+    @simd for i = 1:len
+        @inbounds A[i] = c[i]
     end
     return A
 end
 
-function finalcolumn(col, T, buf, QS, escapedstrings, refs, i, pool, categorical, categoricalpools)
-    if T === STRING
-        return StringArray{escapedstrings ? QS : String, 1}(buf, col.offsets, col.lengths)
-    elseif T === (STRING | MISSING)
-        return StringArray{Union{escapedstrings ? QS : String, Missing}, 1}(buf, col.offsets, col.lengths)
-    elseif pool > 0.0 && (T === POOL || (T === (POOL | MISSING)))
-        refs = refs[i]
-        if !categorical
-            if missingtype(T)
-                missingref = maximum(col.lengths) + UInt32(1)
-                replace!(col.lengths, UInt32(0) => missingref)
-                refs[missing] = missingref
-            else
-                refs = convert(Dict{String, UInt32}, refs)
-            end
-            return PooledArray(PooledArrays.RefArray(col.lengths), refs)
-        else
-            pool = categoricalpools[i]
-            if missingtype(T)
-                return CategoricalArray{Union{Missing, String}, 1}(col.lengths, pool)
-            else
-                return CategoricalArray{String, 1}(col.lengths, pool)
-            end
+function Base.copy(c::Column{T, T}) where {T <: Union{String, Union{String, Missing}}}
+    len = length(c)
+    A = StringVector{T}(undef, len)
+    @simd for i = 1:len
+        @inbounds A[i] = c[i]
+    end
+    return A
+end
+
+function Base.copy(c::Column{T, S}) where {T <: Union{String, Union{String, Missing}}, S <: Union{PooledString, Union{PooledString, Missing}}}
+    len = length(c)
+    catg = getcategorical(c.f)
+    if S === PooledString
+        refs = Dict{String, UInt32}()
+        foreach(x->setindex!(refs, UInt32(x[1]), x[2]), enumerate(getrefs(c.f)[c.col]))
+        values = Vector{UInt32}(undef, len)
+        @simd for i = 1:len
+            @inbounds values[i] = ref(gettape(c.f)[c.r[i]])
         end
     else
-        return getfield(col, fieldindex(TYPECODES[T]))
-    end
-end
-
-function setchunk!(A, row, chunkrows, tape, tapeidx, ncol, f)
-    for rowoff = 0:chunkrows
-        @inbounds A[row + rowoff] = f(tape[tapeidx + (rowoff * ncol * 2) + 1])
-    end
-    return
-end
-
-function setchunk!(A::Vector{Float64}, row, chunkrows, tape, tapeidx, ncol, f)
-    for rowoff = 0:chunkrows
-        @inbounds offlen = tape[tapeidx + (rowoff * ncol * 2)]
-        @inbounds x = tape[tapeidx + (rowoff * ncol * 2) + 1]
-        @inbounds A[row + rowoff] = intvalue(offlen) ? Float64(int64(x)) : float64(x)
-    end
-    return
-end
-
-function setchunkm!(A, row, chunkrows, tape, tapeidx, ncol, f)
-    for rowoff = 0:chunkrows
-        @inbounds offlen = tape[tapeidx + (rowoff * ncol * 2)]
-        @inbounds A[row + rowoff] = missingvalue(offlen) ? missing : f(tape[tapeidx + (rowoff * ncol * 2) + 1])
-    end
-    return
-end
-
-function setchunkm!(A::Vector{Union{Missing, Float64}}, row, chunkrows, tape, tapeidx, ncol, f)
-    for rowoff = 0:chunkrows
-        @inbounds offlen = tape[tapeidx + (rowoff * ncol * 2)]
-        if !missingvalue(offlen)
-            @inbounds x = tape[tapeidx + (rowoff * ncol * 2) + 1]
-            @inbounds A[row + rowoff] = intvalue(offlen) ? Float64(int64(x)) : float64(x)
+        if catg
+            refs = Dict{String, UInt32}()
+            foreach(x->setindex!(refs, UInt32(x[1]), x[2]), enumerate(getrefs(c.f)[c.col]))
+            missingref = UInt32(0)
+            values = Vector{UInt32}(undef, len)
+        else
+            refs = Dict{Union{String, Missing}, UInt32}()
+            foreach(x->setindex!(refs, UInt32(x[1]), x[2]), enumerate(getrefs(c.f)[c.col]))
+            missingref = UInt32(length(refs) + 1)
+            refs[missing] = missingref
+            values = Vector{UInt32}(undef, len)
+        end
+        @simd for i = 1:len
+            @inbounds offlen = gettape(c.f)[c.r[i] - 1]
+            @inbounds values[i] = ifelse(missingvalue(offlen), missingref, ref(gettape(c.f)[c.r[i]]))
         end
     end
-    return
+    if catg
+        pool = CategoricalPool(refs)
+        levels!(pool, sort(levels(pool)))
+        A = CategoricalArray{T, 1}(values, pool)
+    else
+        A = PooledArray(PooledArrays.RefArray(values), refs)
+    end
+    return A
 end
 
-function Tables.columns(f::File)
-    ncol = f.cols
-    ncol == 0 && return DataFrame()
-    f.rows == 0 && return DataFrame(AbstractVector[Missing[] for i = 1:ncol], f.names)
-    typecodes = f.typecodes
-    columns = Column[makecolumn(typecodes[i], f.rows) for i = 1:ncol]
-    escapedstrings = fill(false, ncol)
-    tape = f.tape
-    # the idea of chunking here is to make sure we access as close to a "page" of memory from tape
-    # at a time while storing the values in the output columns; this hasn't been rigourously tested for a performance increase
-    chunk = max(1, div(256, ncol))
-    totalrows = f.rows
-    rowidx = 1
-    for row = 1:chunk:f.rows
-        chunkrows = min(chunk - 1, totalrows - row)
-        for j = 1:ncol
-            @inbounds col = columns[j]
-            @inbounds T = typecodes[j]
-            off = (j - 1) * 2
-            if T === INT
-                setchunk!(col.ints, row, chunkrows, tape, rowidx + off, ncol, int64)
-            elseif T === (INT | MISSING)
-                setchunkm!(col.intsm, row, chunkrows, tape, rowidx + off, ncol, int64)
-            elseif T === FLOAT
-                setchunk!(col.floats, row, chunkrows, tape, rowidx + off, ncol, float64)
-            elseif T === (FLOAT | MISSING)
-                setchunkm!(col.floatsm, row, chunkrows, tape, rowidx + off, ncol, float64)
-            elseif T === DATE
-                setchunk!(col.dates, row, chunkrows, tape, rowidx + off, ncol, date)
-            elseif T === (DATE | MISSING)
-                setchunkm!(col.datesm, row, chunkrows, tape, rowidx + off, ncol, date)
-            elseif T === DATETIME
-                setchunk!(col.datetimes, row, chunkrows, tape, rowidx + off, ncol, datetime)
-            elseif T === (DATETIME | MISSING)
-                setchunkm!(col.datetimesm, row, chunkrows, tape, rowidx + off, ncol, datetime)
-            elseif T === BOOL
-                setchunk!(col.bools, row, chunkrows, tape, rowidx + off, ncol, bool)
-            elseif T === (BOOL | MISSING)
-                setchunkm!(col.boolsm, row, chunkrows, tape, rowidx + off, ncol, bool)
-            elseif T === MISSINGTYPE
-                # don't need to do anything
-            elseif T === POOL || T === (POOL | MISSING)
-                setchunk!(col.lengths, row, chunkrows, tape, rowidx + off, ncol, ref)
-            else
-                for rowoff = 0:chunkrows
-                    @inbounds offlen = tape[rowidx + off + (rowoff * ncol * 2)]
-                    if missingvalue(offlen)
-                        @inbounds col.offsets[row + rowoff] = WeakRefStrings.MISSING_OFFSET
-                    else
-                        # minus 1 because the tape stores the byte *position* and StringArray wants the *offset*
-                        @inbounds col.offsets[row + rowoff] = getpos(offlen) - 1
-                        @inbounds col.lengths[row + rowoff] = unsafe_trunc(UInt32, getlen(offlen))
-                        if escapedvalue(offlen)
-                            @inbounds escapedstrings[j] = true
-                        end
-                    end
-                end
-            end
-        end
-        rowidx += ncol * 2 * chunk
+reinterp_func(::Type{Int64}) = int64
+reinterp_func(::Type{Float64}) = float64
+reinterp_func(::Type{Date}) = date
+reinterp_func(::Type{DateTime}) = datetime
+reinterp_func(::Type{Bool}) = bool
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Missing}, row::Int)
+    @boundscheck checkbounds(c, row)
+    return missing
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{T}, row::Int) where {T}
+    @boundscheck checkbounds(c, row)
+    @inbounds x = reinterp_func(T)(gettape(c.f)[c.r[row]])
+    return x
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Union{T, Missing}}, row::Int) where {T}
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    @inbounds x = ifelse(missingvalue(offlen), missing, reinterp_func(T)(gettape(c.f)[c.r[row]]))
+    return x
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Float64}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    @inbounds v = gettape(c.f)[c.r[row]]
+    @inbounds x = ifelse(intvalue(offlen), Float64(int64(v)), float64(v))
+    return x
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Union{Float64, Missing}}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    @inbounds v = gettape(c.f)[c.r[row]]
+    @inbounds x = ifelse(missingvalue(offlen), missing, ifelse(intvalue(offlen), Float64(int64(v)), float64(v)))
+    return x
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{String, PooledString}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds x = getrefs(c.f)[c.col][gettape(c.f)[c.r[row]]]
+    return x
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Union{String, Missing}, Union{PooledString, Missing}}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    if missingvalue(offlen)
+        return missing
+    else
+        @inbounds x = getrefs(c.f)[c.col][gettape(c.f)[c.r[row]]]
+        return x
     end
-    finalcolumns = columns
-    finaltypecodes = typecodes
-    return DataFrame([finalcolumn(finalcolumns[i], finaltypecodes[i], f.buf, f.escapedstringtype, escapedstrings[i], f.refs, i, f.pool, f.categorical, f.categoricalpools) for i = 1:ncol], f.names; copycols=false)
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{String}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    s = PointerString(pointer(getbuf(c.f), getpos(offlen)), getlen(offlen))
+    return escapedvalue(offlen) ? unescape(s, gete(c.f)) : String(s)
+end
+
+@inline Base.@propagate_inbounds function Base.getindex(c::Column{Union{String, Missing}}, row::Int)
+    @boundscheck checkbounds(c, row)
+    @inbounds offlen = gettape(c.f)[c.r[row] - 1]
+    if missingvalue(offlen)
+        return missing
+    else
+        s = PointerString(pointer(getbuf(c.f), getpos(offlen)), getlen(offlen))
+        return escapedvalue(offlen) ? unescape(s, gete(c.f)) : String(s)
+    end
+end
+
+function Base.getproperty(f::File, col::Symbol)
+    i = findfirst(==(col), getnames(f))
+    i === nothing && return getfield(f, col)
+    return Column(f, i)
 end

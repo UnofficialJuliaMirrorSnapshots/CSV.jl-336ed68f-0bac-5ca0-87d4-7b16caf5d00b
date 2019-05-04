@@ -1,8 +1,9 @@
 module CSV
 
 # stdlib
-using Mmap, Dates, Random, Unicode
-using Parsers, Tables, CategoricalArrays, PooledArrays, WeakRefStrings, DataFrames
+using Mmap, Dates, Unicode
+using Parsers, Tables
+using PooledArrays, CategoricalArrays, WeakRefStrings, DataFrames
 
 function validate(fullpath::Union{AbstractString,IO}; kwargs...)
     Base.depwarn("`CSV.validate` is deprecated. `CSV.read` now prints warnings on misshapen files.", :validate)
@@ -24,33 +25,41 @@ struct File
     buf::Vector{UInt8}
     names::Vector{Symbol}
     types::Vector{Type}
-    typecodes::Vector{TypeCode}
-    escapedstringtype
-    refs::Vector{Dict{Union{Missing, String}, UInt32}}
-    pool::Float64
+    e::UInt8 # escape character, for unescaping strings later
     categorical::Bool
-    categoricalpools::Vector{CategoricalPool{String, UInt32, CatStr}}
+    refs::Vector{Vector{String}}
     rows::Int64
     cols::Int64
     tape::Vector{UInt64}
 end
 
+getname(f::File) = getfield(f, :name)
+getbuf(f::File) = getfield(f, :buf)
+getnames(f::File) = getfield(f, :names)
+gettypes(f::File) = getfield(f, :types)
+gete(f::File) = getfield(f, :e)
+getcategorical(f::File) = getfield(f, :categorical)
+getrefs(f::File) = getfield(f, :refs)
+getrows(f::File) = getfield(f, :rows)
+getcols(f::File) = getfield(f, :cols)
+gettape(f::File) = getfield(f, :tape)
+
 function Base.show(io::IO, f::File)
-    println(io, "CSV.File(\"$(f.name)\"):")
-    println(io, "Size: $(f.rows) x $(f.cols)")
+    println(io, "CSV.File(\"$(getname(f))\"):")
+    println(io, "Size: $(getrows(f)) x $(getcols(f))")
     show(io, Tables.schema(f))
 end
 
 const EMPTY_POSITIONS = Int64[]
 const EMPTY_TYPEMAP = Dict{TypeCode, TypeCode}()
-const EMPTY_REFS = Dict{Union{Missing, String}, UInt32}[]
-const EMPTY_LAST_REFS = UInt32[]
-const EMPTY_CATEGORICAL_POOLS = CategoricalPool{String, UInt32, CatStr}[]
+const EMPTY_REFS = Vector{String}[]
+const EMPTY_REFVALUES = String[]
 
 """
     CSV.File(source; kwargs...) => CSV.File
 
-Read a csv input (a filename given as a String, or any other IO source), returning a `CSV.File` object.
+Read a csv input (a filename given as a String or FilePaths.jl type, or any other IO source), returning a `CSV.File` object.
+
 Opens the file and uses passed arguments to detect the number of columns and column types.
 The returned `CSV.File` object supports the [Tables.jl](https://github.com/JuliaData/Tables.jl) interface
 and can iterate `CSV.Row`s. `CSV.Row` supports `propertynames` and `getproperty` to access individual row values.
@@ -67,7 +76,7 @@ By supporting the Tables.jl interface, a `CSV.File` can also be a table input to
 
 ```julia
 # materialize a csv file as a DataFrame
-df = CSV.File(file) |> DataFrame
+df = CSV.File(file) |> DataFrame!
 
 # load a csv file directly into an sqlite database table
 db = SQLite.DB()
@@ -98,8 +107,8 @@ Supported keyword arguments include:
   * `type`: a single type to use for parsing an entire file; i.e. all columns will be treated as the same type; useful for matrix-like data files
   * `types`: a Vector or Dict of types to be used for column types; a Dict can map column index `Int`, or name `Symbol` or `String` to type for a column, i.e. Dict(1=>Float64) will set the first column as a Float64, Dict(:column1=>Float64) will set the column named column1 to Float64 and, Dict("column1"=>Float64) will set the column1 to Float64; if a `Vector` if provided, it must match the # of columns provided or detected in `header`
   * `typemap::Dict{Type, Type}`: a mapping of a type that should be replaced in every instance with another type, i.e. `Dict(Float64=>String)` would change every detected `Float64` column to be parsed as `String`
-  * `categorical::Union{Bool, Float64}=false`: if `true`, columns detected as `String` are returned as a `CategoricalArray`; alternatively, the proportion of unique values below which `String` columns should be treated as categorical (for example 0.1 for 10%, which means if the # of unique strings in a column is under 10%, it will be parsed as a CategoricalArray)
-  * `pool::Union{Bool, Float64}=0.1`: if `true`, columns detected as `String` are returned as a `PooledArray`; alternatively, the proportion of unique values below which `String` columns should be pooled (by default 0.1, meaning that if the # of unique strings in a column is under 10%, it will be pooled)
+  * `pool::Union{Bool, Float64}=0.1`: if `true`, *all* columns detected as `String` will be internally pooled; alternatively, the proportion of unique values below which `String` columns should be pooled (by default 0.1, meaning that if the # of unique strings in a column is under 10%, it will be pooled)
+  * `categorical::Bool=false`: whether pooled columns should be copied as CategoricalArray instead of PooledArray
   * `strict::Bool=false`: whether invalid values should throw a parsing error or be replaced with `missing`
   * `silencewarnings::Bool=false`: if `strict=false`, whether invalid value warnings should be silenced
 """
@@ -146,6 +155,13 @@ function File(source;
     (types !== nothing && any(x->!isconcretetype(x) && !(x isa Union), types isa AbstractDict ? values(types) : types)) && throw(ArgumentError("Non-concrete types passed in `types` keyword argument, please provide concrete types for columns: $types"))
     delim !== nothing && ((delim isa Char && iscntrl(delim) && delim != '\t') || (delim isa String && any(iscntrl, delim) && !all(==('\t'), delim))) && throw(ArgumentError("invalid delim argument = '$(escape_string(string(delim)))', must be a non-control character or string without control characters"))
     allowmissing !== nothing && @warn "`allowmissing` is a deprecated keyword argument"
+    if !(categorical isa Bool)
+        @warn "categorical=$categorical is deprecated in favor of `pool=$categorical`; categorical is only used to determine CategoricalArray vs. PooledArrays"
+        pool = categorical
+        categorical = categorical > 0.0
+    elseif categorical === true
+        pool = categorical
+    end
     header = (isa(header, Integer) && header == 1 && (datarow == 1 || skipto == 1)) ? -1 : header
     isa(header, Integer) && datarow != -1 && (datarow > header || throw(ArgumentError("data row ($datarow) must come after header row ($header)")))
     datarow = skipto !== nothing ? skipto : (datarow == -1 ? (isa(header, Vector{Symbol}) || isa(header, Vector{String}) ? 0 : last(header)) + 1 : datarow) # by default, data starts on line after header
@@ -160,7 +176,6 @@ function File(source;
     oq = something(openquotechar, quotechar) % UInt8
     cq = something(closequotechar, quotechar) % UInt8
     eq = escapechar % UInt8
-    escapedstringtype = WeakRefStrings.EscapedString{eq}
     cmt = comment === nothing ? nothing : (pointer(comment), sizeof(comment))
     rowsguess, del = guessnrows(buf, oq, cq, eq, source, delim, cmt, debug)
     debug && println("estimated rows: $rowsguess")
@@ -177,23 +192,22 @@ function File(source;
     # determine column names and where the data starts in the file; for transpose, we note the starting byte position of each column
     if transpose
         rowsguess, names, positions = datalayout_transpose(header, buf, pos, len, options, datarow, normalizenames)
-        datapos = positions[1]
+        datapos = isempty(positions) ? 0 : positions[1]
     else
         positions = EMPTY_POSITIONS
-        names, datapos = datalayout(header, buf, pos, len, options, datarow, normalizenames, cmt, ignorerepeated)
+        names, datapos = datalayout(header, buf, pos, len, options, datarow, normalizenames, cmt)
     end
     debug && println("column names detected: $names")
     debug && println("byte position of data computed at: $datapos")
 
     # deduce initial column types for parsing based on whether any user-provided types were provided or not
-    catg = false
     T = type === nothing ? EMPTY : (typecode(type) | USER)
     if types isa Vector
         typecodes = TypeCode[typecode(T) | USER for T in types]
-        catg = any(T->T <: CatStr, types)
+        categorical = categorical | any(x->x == CategoricalString{UInt32}, types)
     elseif types isa AbstractDict
         typecodes = initialtypes(T, types, names)
-        catg = any(T->T <: CatStr, values(types))
+        categorical = categorical | any(x->x == CategoricalString{UInt32}, values(types))
     else
         typecodes = TypeCode[T for _ = 1:length(names)]
     end
@@ -202,36 +216,32 @@ function File(source;
     # we now do our parsing pass over the file, starting at datapos
     # we fill in our "tape", which has two UInt64 slots for each cell in row-major order (linearly indexed)
     # the 1st UInt64 is used for noting the byte position, len, and other metadata of the field within the file:
-        # top bit indicates a missing value
-        # 2nd bit indicates a cell initially parsed as Int (used if column later gets promoted to Float64)
-        # 3rd bit indicates if a field was quoted and included escape chararacters (will have to be unescaped later)
-        # 45 bits for position (allows for maximum file of 35TB)
+        # leftmost bit indicates a sentinel value was detected while parsing, resulting cell value will be `missing`
+        # 2nd leftmost bit indicates a cell initially parsed as Int (used if column later gets promoted to Float64)
+        # 3rd leftmost bit indicates if a field was quoted and included escape chararacters (will have to be unescaped later)
+        # 45 bits for position (allows for maximum file size of 35TB)
         # 16 bits for field length (allows for maximum field size of 65K)
     # the 2nd UInt64 is used for storing the raw bits of a parsed, typed value: Int64, Float64, Date, DateTime, Bool, or categorical/pooled UInt32 ref
     ncols = length(names)
     # might as well round up to the next largest pagesize, since mmap aligns to it anyway
     tape = Mmap.mmap(Vector{UInt64}, roundup((rowsguess * ncols * 2), Mmap.PAGESIZE))
-    catg |= categorical === true || categorical isa Float64
-    pool = (pool === true || categorical === true || any(pooled, typecodes)) ? 1.0 :
-            categorical isa Float64 ? categorical : pool isa Float64 ? pool : 0.0
-    refs = pool > 0.0 ? [Dict{Union{Missing, String}, UInt32}() for i = 1:ncols] : EMPTY_REFS
-    lastrefs = pool > 0.0 ? [UInt32(0) for i = 1:ncols] : EMPTY_LAST_REFS
+    pool = pool === true ? 1.0 : pool isa Float64 ? pool : 0.0
+    refs = Vector{Dict{String, UInt64}}(undef, ncols)
+    lastrefs = zeros(UInt64, ncols)
     t = time()
     rows = parsetape(Val(transpose), ncols, gettypecodes(typemap), tape, buf, datapos, len, limit, cmt, positions, pool, refs, lastrefs, rowsguess, typecodes, debug, options)
     debug && println("time for initial parsing to tape: $(time() - t)")
     foreach(1:ncols) do i
         typecodes[i] &= ~USER
     end
-    types = [pooled(T) ? catg ? CatStr : PooledString : TYPECODES[T] for T in typecodes]
+    types = [TYPECODES[T] for T in typecodes]
     debug && println("types after parsing: $types")
-    if catg
-        foreach(x->delete!(x, missing), refs)
-        categoricalpools = [CategoricalPool(convert(Dict{String, UInt32}, r)) for r in refs]
-        foreach(x->levels!(x, sort(levels(x))), categoricalpools)
+    if pool > 0.0
+        refs = [isassigned(refs, i) ? map(x->x[1], sort!(collect(refs[i]), by=x->x[2])) : EMPTY_REFVALUES for i = 1:ncols]
     else
-        categoricalpools = EMPTY_CATEGORICAL_POOLS
+        refs = EMPTY_REFS
     end
-    return File(getname(source), buf, names, types, typecodes, escapedstringtype, refs, pool, catg, categoricalpools, rows - footerskip, ncols, tape)
+    return File(getname(source), buf, names, types, eq, categorical, refs, rows - footerskip, ncols, tape)
 end
 
 function parsetape(::Val{transpose}, ncols, typemap, tape, buf, pos, len, limit, cmt, positions, pool, refs, lastrefs, rowsguess, typecodes, debug, options::Parsers.Options{ignorerepeated}) where {transpose, ignorerepeated}
@@ -252,9 +262,9 @@ function parsetape(::Val{transpose}, ncols, typemap, tape, buf, pos, len, limit,
                 @inbounds T = typecodes[col]
                 type = typebits(T)
                 if type === EMPTY
-                    pos, code = parseempty!(tape, tapeidx, buf, pos, len, options, col, typemap, pool, refs, lastrefs, debug, typecodes)
+                    pos, code = detect(tape, tapeidx, buf, pos, len, options, row, col, typemap, pool, refs, lastrefs, debug, typecodes)
                 elseif type === MISSINGTYPE
-                    pos, code = parsemissing!(tape, tapeidx, buf, pos, len, options, col, typemap, pool, refs, lastrefs, debug, typecodes)
+                    pos, code = detect(tape, tapeidx, buf, pos, len, options, row, col, typemap, pool, refs, lastrefs, debug, typecodes)
                 elseif type === INT
                     pos, code = parseint!(T, tape, tapeidx, buf, pos, len, options, row, col, typecodes)
                 elseif type === FLOAT
@@ -266,9 +276,9 @@ function parsetape(::Val{transpose}, ncols, typemap, tape, buf, pos, len, limit,
                 elseif type === BOOL
                     pos, code = parsevalue!(Bool, T, tape, tapeidx, buf, pos, len, options, row, col, typecodes)
                 elseif type === POOL
-                    pos, code = parsepooled!(T, tape, tapeidx, buf, pos, len, options, col, rowsguess, pool, refs[col], lastrefs, typecodes)
+                    pos, code = parsepooled!(T, tape, tapeidx, buf, pos, len, options, row, col, rowsguess, pool, refs, lastrefs, typecodes)
                 else # STRING
-                    pos, code = parsestring!(T, tape, tapeidx, buf, pos, len, options, col, typecodes)
+                    pos, code = parsestring!(T, tape, tapeidx, buf, pos, len, options, row, col, typecodes)
                 end
                 tapeidx += 2
                 if transpose
@@ -331,104 +341,87 @@ const NONINTVALUE = Val(false)
     return
 end
 
-function parseempty!(tape, tapeidx, buf, pos, len, options, col, typemap, pool, refs, lastrefs, debug, typecodes)
-    x, code, vpos, vlen, tlen = detecttype(buf, pos, len, options, debug)
-    T = Parsers.sentinel(code) ? MISSINGTYPE : typecode(x)
-    T = get(typemap, T, T)
-    if T == INT
-        setposlen!(tape, tapeidx, code, vpos, vlen, INTVALUE)
-        @inbounds tape[tapeidx + 1] = uint64(x)
-    else
-        setposlen!(tape, tapeidx, code, vpos, vlen)
-        if MISSINGTYPE < T < STRING
-            @inbounds tape[tapeidx + 1] = uint64(x)
-        elseif T === STRING
-            if pool > 0.0
-                T = POOL
-                ref = getref!(refs[col], WeakRefString(pointer(buf, vpos), vlen), lastrefs, col)
-                @inbounds tape[tapeidx + 1] = uint64(ref)
-            end
-        end
-    end
-    @inbounds typecodes[col] = T
-    return pos + tlen, code
-end
-
-function parsemissing!(tape, tapeidx, buf, pos, len, options, col, typemap, pool, refs, lastrefs, debug, typecodes)
-    x, code, vpos, vlen, tlen = detecttype(buf, pos, len, options, debug)
-    T = Parsers.sentinel(code) ? MISSINGTYPE : typecode(x)
-    T = get(typemap, T, T)
-    if T == INT
-        setposlen!(tape, tapeidx, code, vpos, vlen, INTVALUE)
-        @inbounds tape[tapeidx + 1] = uint64(x)
-    else
-        setposlen!(tape, tapeidx, code, vpos, vlen)
-        if MISSINGTYPE < T < STRING
-            @inbounds tape[tapeidx + 1] = uint64(x)
-        elseif T === STRING
-            if pool > 0.0
-                T = POOL
-                ref = getref!(refs[col], WeakRefString(pointer(buf, vpos), vlen), lastrefs, col)
-                @inbounds tape[tapeidx + 1] = uint64(ref)
-            end
-        end
-    end
-    @inbounds typecodes[col] = T === MISSINGTYPE ? T : T | MISSING
-    return pos + tlen, code
-end
-
-function detecttype(buf, pos, len, options, debug)
+function detect(tape, tapeidx, buf, pos, len, options, row, col, typemap, pool, refs, lastrefs, debug, typecodes)
     int, code, vpos, vlen, tlen = Parsers.xparse(Int64, buf, pos, len, options)
-    if debug
-        println("type detection on: \"$(escape_string(unsafe_string(pointer(buf, pos), tlen)))\"")
-        println("attempted Int: $(Parsers.codes(code))")
+    if Parsers.invalidquotedfield(code)
+        fatalerror(buf, pos, tlen, code, row, col)
     end
-    Parsers.ok(code) && return int, code, vpos, vlen, tlen
+    if Parsers.sentinel(code) && code > 0
+        setposlen!(tape, tapeidx, code, vpos, vlen)
+        @inbounds typecodes[col] = MISSINGTYPE
+        @goto done
+    end
+    @inbounds T = typecodes[col]
+    if Parsers.ok(code) && !haskey(typemap, INT)
+        setposlen!(tape, tapeidx, code, vpos, vlen, INTVALUE)
+        @inbounds tape[tapeidx + 1] = uint64(int)
+        @inbounds typecodes[col] = T == MISSINGTYPE ? (INT | MISSING) : INT
+        @goto done
+    end
     float, code, vpos, vlen, tlen = Parsers.xparse(Float64, buf, pos, len, options)
-    if debug
-        println("attempted Float64: $(Parsers.codes(code))")
+    if Parsers.ok(code) && !haskey(typemap, FLOAT)
+        setposlen!(tape, tapeidx, code, vpos, vlen)
+        @inbounds tape[tapeidx + 1] = uint64(float)
+        @inbounds typecodes[col] = T == MISSINGTYPE ? (FLOAT | MISSING) : FLOAT
+        @goto done
     end
-    Parsers.ok(code) && return float, code, vpos, vlen, tlen
     if options.dateformat === nothing
         try
             date, code, vpos, vlen, tlen = Parsers.xparse(Date, buf, pos, len, options)
-            if debug
-                println("attempted Date: $(Parsers.codes(code))")
-            end 
-            Parsers.ok(code) && return date, code, vpos, vlen, tlen
+            if Parsers.ok(code) && !haskey(typemap, DATE)
+                setposlen!(tape, tapeidx, code, vpos, vlen)
+                @inbounds tape[tapeidx + 1] = uint64(date)
+                @inbounds typecodes[col] = T == MISSINGTYPE ? (DATE | MISSING) : DATE
+                @goto done
+            end
         catch e
-            # @error exception=(e, stacktrace(catch_backtrace()))
         end
         try
             datetime, code, vpos, vlen, tlen = Parsers.xparse(DateTime, buf, pos, len, options)
-            if debug
-                println("attempted DateTime: $(Parsers.codes(code))")
+            if Parsers.ok(code) && !haskey(typemap, DATETIME)
+                setposlen!(tape, tapeidx, code, vpos, vlen)
+                @inbounds tape[tapeidx + 1] = uint64(datetime)
+                @inbounds typecodes[col] = T == MISSINGTYPE ? (DATETIME | MISSING) : DATETIME
+                @goto done
             end
-            Parsers.ok(code) && return datetime, code, vpos, vlen, tlen
         catch e
-            # @error exception=(e, stacktrace(catch_backtrace()))
         end
     else
         # use user-provided dateformat
-        T = timetype(options.dateformat)
-        dt, code, vpos, vlen, tlen = Parsers.xparse(T, buf, pos, len, options)
-        if debug
-            println("attempted $T: $(Parsers.codes(code))")
+        DT = timetype(options.dateformat)
+        dt, code, vpos, vlen, tlen = Parsers.xparse(DT, buf, pos, len, options)
+        if Parsers.ok(code)
+            setposlen!(tape, tapeidx, code, vpos, vlen)
+            @inbounds tape[tapeidx + 1] = uint64(dt)
+            @inbounds typecodes[col] = DT == Date ? (T == MISSINGTYPE ? (DATE | MISSING) : DATE) : (T == MISSINGTYPE ? (DATETIME | MISSING) : DATETIME)
+            @goto done
         end
-        Parsers.ok(code) && return dt, code, vpos, vlen, tlen
     end
     bool, code, vpos, vlen, tlen = Parsers.xparse(Bool, buf, pos, len, options)
-    if debug
-        println("attempted Bool: $(Parsers.codes(code))")
+    if Parsers.ok(code) && !haskey(typemap, BOOL)
+        setposlen!(tape, tapeidx, code, vpos, vlen)
+        @inbounds tape[tapeidx + 1] = uint64(bool)
+        @inbounds typecodes[col] = T == MISSINGTYPE ? (BOOL | MISSING) : BOOL
+        @goto done
     end
-    Parsers.ok(code) && return bool, code, vpos, vlen, tlen
-    str, code, vpos, vlen, tlen = Parsers.xparse(String, buf, pos, len, options)
-    return "", code, vpos, vlen, tlen
+    _, code, vpos, vlen, tlen = Parsers.xparse(String, buf, pos, len, options)
+    setposlen!(tape, tapeidx, code, vpos, vlen)
+    if pool > 0.0
+        r = Dict{String, UInt64}()
+        @inbounds refs[col] = r
+        ref = getref!(r, PointerString(pointer(buf, vpos), vlen), lastrefs, col, code, options)
+        @inbounds tape[tapeidx + 1] = ref
+        @inbounds typecodes[col] = T == MISSINGTYPE ? (POOL | MISSING) : POOL
+    else
+        @inbounds typecodes[col] = T == MISSINGTYPE ? (STRING | MISSING) : STRING
+    end
+@label done
+    return pos + tlen, code
 end
 
 @inline function parseint!(T, tape, tapeidx, buf, pos, len, options, row, col, typecodes)
     x, code, vpos, vlen, tlen = Parsers.xparse(Int64, buf, pos, len, options)
-    if Parsers.succeeded(code)
+    if code > 0
         if !Parsers.sentinel(code)
             @inbounds tape[tapeidx + 1] = uint64(x)
             if !user(T)
@@ -441,7 +434,7 @@ end
     else
         if Parsers.invalidquotedfield(code)
             # this usually means parsing is borked because of an invalidly quoted field, hard error
-            fatalerror(buf, pos, len, code, row, col)
+            fatalerror(buf, pos, tlen, code, row, col)
         end
         if user(T)
             if !options.strict
@@ -453,7 +446,7 @@ end
             end
         else
             y, code, vpos, vlen, tlen = Parsers.xparse(Float64, buf, pos, len, options)
-            if Parsers.succeeded(code)
+            if code > 0
                 @inbounds tape[tapeidx + 1] = uint64(y)
                 @inbounds typecodes[col] = FLOAT | (missingtype(T) ? MISSING : EMPTY)
             else
@@ -468,16 +461,17 @@ end
 
 function parsevalue!(::Type{type}, T, tape, tapeidx, buf, pos, len, options, row, col, typecodes) where {type}
     x, code, vpos, vlen, tlen = Parsers.xparse(type, buf, pos, len, options)
-    if Parsers.succeeded(code)
+    if code > 0
         if !Parsers.sentinel(code)
             @inbounds tape[tapeidx + 1] = uint64(x)
         else
             @inbounds typecodes[col] = T | MISSING
+            @inbounds tape[tapeidx] = MISSING_BIT
         end
     else
         if Parsers.invalidquotedfield(code)
             # this usually means parsing is borked because of an invalidly quoted field, hard error
-            fatalerror(buf, pos, len, code, row, col)
+            fatalerror(buf, pos, tlen, code, row, col)
         end
         if user(T)
             if !options.strict
@@ -499,40 +493,54 @@ function parsevalue!(::Type{type}, T, tape, tapeidx, buf, pos, len, options, row
     return pos + tlen, code
 end
 
-@inline function parsestring!(T, tape, tapeidx, buf, pos, len, options, col, typecodes)
+@inline function parsestring!(T, tape, tapeidx, buf, pos, len, options, row, col, typecodes)
     x, code, vpos, vlen, tlen = Parsers.xparse(String, buf, pos, len, options)
     setposlen!(tape, tapeidx, code, vpos, vlen)
+    if Parsers.invalidquotedfield(code)
+        # this usually means parsing is borked because of an invalidly quoted field, hard error
+        fatalerror(buf, pos, tlen, code, row, col)
+    end
     if Parsers.sentinel(code)
         @inbounds typecodes[col] = STRING | MISSING
     end
     return pos + tlen, code
 end
 
-@inline function getref!(x::Dict, key::WeakRefString, lastrefs, col)
+@inline function getref!(x::Dict, key::PointerString, lastrefs, col, code, options)
     index = Base.ht_keyindex2!(x, key)
     if index > 0
         @inbounds found_key = x.vals[index]
-        return found_key::UInt32
+        return found_key::UInt64
     else
-        @inbounds new = (lastrefs[col] += UInt32(1))
-        @inbounds Base._setindex!(x, new, String(key), -index)
+        @inbounds new = (lastrefs[col] += UInt64(1))
+        @inbounds Base._setindex!(x, new, Parsers.escapedstring(code) ? unescape(key, options.e) : String(key), -index)
         return new
     end
 end
 
-function parsepooled!(T, tape, tapeidx, buf, pos, len, options, col, rowsguess, pool, refs, lastrefs, typecodes)
+function parsepooled!(T, tape, tapeidx, buf, pos, len, options, row, col, rowsguess, pool, refs, lastrefs, typecodes)
     x, code, vpos, vlen, tlen = Parsers.xparse(String, buf, pos, len, options)
     setposlen!(tape, tapeidx, code, vpos, vlen)
+    if Parsers.invalidquotedfield(code)
+        # this usually means parsing is borked because of an invalidly quoted field, hard error
+        fatalerror(buf, pos, tlen, code, row, col)
+    end
     if Parsers.sentinel(code)
         @inbounds typecodes[col] = T | MISSING
-        ref = UInt32(0)
+        ref = UInt64(0)
     else
-        ref = getref!(refs, WeakRefString(pointer(buf, vpos), vlen), lastrefs, col)
+        if !isassigned(refs, col)
+            r = Dict{String, UInt64}()
+            @inbounds refs[col] = r
+        else
+            @inbounds r = refs[col]
+        end
+        ref = getref!(r, PointerString(pointer(buf, vpos), vlen), lastrefs, col, code, options)
     end
-    if !user(T) && (length(refs) / rowsguess) > pool
+    if !user(T) && isassigned(refs, col) && (length(refs[col]) / rowsguess) > pool
         @inbounds typecodes[col] = STRING | (missingtype(typecodes[col]) ? MISSING : EMPTY)
     else
-        @inbounds tape[tapeidx + 1] = uint64(ref)
+        @inbounds tape[tapeidx + 1] = ref
     end
     return pos + tlen, code
 end
@@ -542,44 +550,13 @@ include("iteration.jl")
 include("write.jl")
 
 """
-`CSV.read(source; kwargs...)` => `DataFrame`
+`CSV.read(source; copycols::Bool=false, kwargs...)` => `DataFrame`
 
-Parses a delimited file into a `DataFrame`.
+Parses a delimited file into a `DataFrame`. `copycols` determines whether a copy of columns should be made when creating the DataFrame; by default, no copy is made, and the DataFrame is built with immutable, read-only `CSV.Column` vectors. If mutable operations are needed on the DataFrame columns, set `copycols=true`.
 
-Positional arguments:
-
-* `source`: can be a file name (String or FilePaths.jl type) of the location of the csv file or an `IO` or `Vector{UInt8}` buffer to read the csv from directly
-
-Supported keyword arguments include:
-* File layout options:
-  * `header=1`: the `header` argument can be an `Int`, indicating the row to parse for column names; or a `Range`, indicating a span of rows to be concatenated together as column names; or an entire `Vector{Symbol}` or `Vector{String}` to use as column names; if a file doesn't have column names, either provide them as a `Vector`, or set `header=0` or `header=false` and column names will be auto-generated (`Column1`, `Column2`, etc.)
-  * `normalizenames=false`: whether column names should be "normalized" into valid Julia identifier symbols; useful when iterating rows and accessing column values of a row via `getproperty` (e.g. `row.col1`)
-  * `datarow`: an `Int` argument to specify the row where the data starts in the csv file; by default, the next row after the `header` row is used. If `header=0`, then the 1st row is assumed to be the start of data
-  * `skipto::Int`: similar to `datarow`, specifies the number of rows to skip before starting to read data
-  * `footerskip::Int`: number of rows at the end of a file to skip parsing
-  * `limit`: an `Int` to indicate a limited number of rows to parse in a csv file; use in combination with `skipto` to read a specific, contiguous chunk within a file
-  * `transpose::Bool`: read a csv file "transposed", i.e. each column is parsed as a row
-  * `comment`: rows that begin with this `String` will be skipped while parsing
-  * `use_mmap::Bool=!Sys.iswindows()`: whether the file should be mmapped for reading, which in some cases can be faster
-* Parsing options:
-  * `missingstrings`, `missingstring`: either a `String`, or `Vector{String}` to use as sentinel values that will be parsed as `missing`; by default, only an empty field (two consecutive delimiters) is considered `missing`
-  * `delim=','`: a `Char` or `String` that indicates how columns are delimited in a file; if no argument is provided, parsing will try to detect the most consistent delimiter on the first 10 rows of the file
-  * `ignorerepeated::Bool=false`: whether repeated (consecutive) delimiters should be ignored while parsing; useful for fixed-width files with delimiter padding between cells
-  * `quotechar='"'`, `openquotechar`, `closequotechar`: a `Char` (or different start and end characters) that indicate a quoted field which may contain textual delimiters or newline characters
-  * `escapechar='"'`: the `Char` used to escape quote characters in a quoted field
-  * `dateformat::Union{String, Dates.DateFormat, Nothing}`: a date format string to indicate how Date/DateTime columns are formatted for the entire file
-  * `decimal='.'`: a `Char` indicating how decimals are separated in floats, i.e. `3.14` used '.', or `3,14` uses a comma ','
-  * `truestrings`, `falsestrings`: `Vectors of Strings` that indicate how `true` or `false` values are represented; by default only `true` and `false` are treated as `Bool`
-* Column Type Options:
-  * `type`: a single type to use for parsing an entire file; i.e. all columns will be treated as the same type; useful for matrix-like data files
-  * `types`: a Vector or Dict of types to be used for column types; a Dict can map column index `Int`, or name `Symbol` or `String` to type for a column, i.e. Dict(1=>Float64) will set the first column as a Float64, Dict(:column1=>Float64) will set the column named column1 to Float64 and, Dict("column1"=>Float64) will set the column1 to Float64; if a `Vector` if provided, it must match the # of columns provided or detected in `header`
-  * `typemap::Dict{Type, Type}`: a mapping of a type that should be replaced in every instance with another type, i.e. `Dict(Float64=>String)` would change every detected `Float64` column to be parsed as `String`
-  * `categorical::Union{Bool, Float64}=false`: if `true`, columns detected as `String` are returned as a `CategoricalArray`; alternatively, the proportion of unique values below which `String` columns should be treated as categorical (for example 0.1 for 10%, which means if the # of unique strings in a column is under 10%, it will be parsed as a CategoricalArray)
-  * `pool::Union{Bool, Float64}=0.1`: if `true`, columns detected as `String` are returned as a `PooledArray`; alternatively, the proportion of unique values below which `String` columns should be pooled (by default 0.1, meaning that if the # of unique strings in a column is under 10%, it will be pooled)
-  * `strict::Bool=false`: whether invalid values should throw a parsing error or be replaced with `missing`
-  * `silencewarnings::Bool=false`: if `strict=false`, whether invalid value warnings should be silenced
+`CSV.read` supports the same keyword arguments as [`CSV.File`](@ref).
 """
-read(source; kwargs...) = CSV.File(source; kwargs...) |> DataFrame!
+read(source; copycols::Bool=false, kwargs...) = DataFrame(CSV.File(source; kwargs...), copycols=copycols)
 
 function __init__()
     Threads.resize_nthreads!(VALUE_BUFFERS)
