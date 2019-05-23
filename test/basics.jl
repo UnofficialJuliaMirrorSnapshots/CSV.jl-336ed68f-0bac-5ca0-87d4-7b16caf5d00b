@@ -307,4 +307,15 @@ row = first(f)
 row = iterate(f, 2)[1]
 @test row.int_float === 3.14
 
+# reported by oxinabox on slack; issue w/ manually specified pool column type and 0 rows
+df = CSV.read(IOBuffer("x\n"), types=[CSV.PooledString], copycols=true)
+@test size(df) == (0, 1)
+
+df = CSV.read(IOBuffer("x\n"), types=[Union{CSV.PooledString, Missing}], copycols=true)
+@test size(df) == (0, 1)
+
+f = CSV.File(IOBuffer("x\n1\n2\n3\n#4"), comment="#")
+@test length(f.x) == 3
+@test f.x[end] == 3
+
 end
