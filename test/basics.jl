@@ -1,3 +1,6 @@
+struct CSV_Foo
+end
+
 @testset "CSV.File basics" begin
 
 #test on non-existent file
@@ -82,6 +85,11 @@ end
 rows = collect(f)
 @test rows[1].a == 1
 @test rows[1].a == 1
+
+# 459
+rows = collect(CSV.File(joinpath(dir, "time.csv"); dateformat="H:M:S"))
+@test rows[1].time == Time(0)
+@test rows[2].time == Time(0, 10)
 
 # 388
 df = CSV.read(joinpath(dir, "GSM2230757_human1_umifm_counts.csv"))
@@ -307,6 +315,9 @@ row = first(f)
 row = iterate(f, 2)[1]
 @test row.int_float === 3.14
 
+# 448
+@test_throws ArgumentError CSV.File(IOBuffer("x\n1\n2\n3\n#4"), ignorerepeated=true)
+
 # reported by oxinabox on slack; issue w/ manually specified pool column type and 0 rows
 df = CSV.read(IOBuffer("x\n"), types=[CSV.PooledString], copycols=true)
 @test size(df) == (0, 1)
@@ -317,5 +328,13 @@ df = CSV.read(IOBuffer("x\n"), types=[Union{CSV.PooledString, Missing}], copycol
 f = CSV.File(IOBuffer("x\n1\n2\n3\n#4"), comment="#")
 @test length(f.x) == 3
 @test f.x[end] == 3
+
+# 453
+@test_throws ArgumentError CSV.File(IOBuffer("x\n1\n2\n3\n#4"), types=[CSV_Foo])
+@test_throws ArgumentError CSV.File(IOBuffer("x\n1\n2\n3\n#4"), types=Dict(:x=>CSV_Foo))
+
+# 447
+df = CSV.read(IOBuffer("a,b,c\n1,2,3\n\n"), ignoreemptylines=true)
+@test size(df) == (1, 3)
 
 end

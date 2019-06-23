@@ -142,6 +142,14 @@ end
     @test length(rows[1]) == 3
     @test rows[1] == ["1", "2", "3"]
 
+    # 448
+    @test_throws ArgumentError CSV.Rows(IOBuffer("x\n1\n2\n3\n#4"), ignorerepeated=true)
+
+    # 447
+    rows = collect(CSV.Rows(IOBuffer("a,b,c\n1,2,3\n\n"), ignoreemptylines=true))
+    @test length(rows) == 1
+    @test rows[1] == ["1", "2", "3"]
+
     # not enough columns
     rows = collect(CSV.Rows(IOBuffer("x,y,z\n1\n2,3\n4,5,6")))
     @test length(rows) == 3
@@ -173,6 +181,19 @@ end
     for (i, row) in enumerate(CSV.Rows(IOBuffer("x\n1\n2\n3"), reusebuffer=true))
         @test row == [string(i)]
     end
+
+end
+
+@testset "CSV.detect" begin
+
+@test CSV.detect("") == ""
+@test CSV.detect("1") == 1
+@test CSV.detect("1.1") == 1.1
+@test CSV.detect("2015-01-01") == Date(2015)
+@test CSV.detect("2015-01-01T03:04:05") == DateTime(2015, 1, 1, 3, 4, 5)
+@test CSV.detect("true") === true
+@test CSV.detect("false") === false
+@test CSV.detect("abc") === "abc"
 
 end
 
