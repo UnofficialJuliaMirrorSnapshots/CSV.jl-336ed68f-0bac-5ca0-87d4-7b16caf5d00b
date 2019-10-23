@@ -1,4 +1,4 @@
-using Test, CSV, Dates, Tables, DataFrames, CategoricalArrays, PooledArrays, CodecZlib
+using Test, CSV, Dates, Tables, DataFrames, CategoricalArrays, PooledArrays, CodecZlib, FilePathsBase
 
 const dir = joinpath(dirname(pathof(CSV)), "..", "test", "testfiles")
 
@@ -75,7 +75,7 @@ end
     v = f.X[1]
     @test v == "b"
     @test levels(v.pool) == ["a", "b", "c"]
-    
+
     f = CSV.read(IOBuffer("X\nb\nc\na\nc"), categorical=true, copycols=true)
     v = f.X[1]
     @test v == "b"
@@ -141,6 +141,11 @@ end
     @test length(rows) == 1
     @test length(rows[1]) == 3
     @test rows[1] == ["1", "2", "3"]
+    row = rows[1]
+    @test CSV.Parsers.parse(Int, row, 1) == 1
+    @test CSV.Parsers.parse(Int, row, :x) == 1
+    @test CSV.detect(row, 2) == 2
+    @test CSV.detect(row, :y) == 2
 
     # 448
     @test_throws ArgumentError CSV.Rows(IOBuffer("x\n1\n2\n3\n#4"), ignorerepeated=true)

@@ -175,27 +175,25 @@ function slurp(source)
     return final
 end
 
+getsource(source::Vector{UInt8}, ::Any) = source
+getsource(source::Cmd, ::Any) = Base.read(source)
+getsource(source::AbstractPath, ::Any) = Base.read(open(source))
+getsource(source::IO, ::Any) = slurp(source)
+getsource(source::SystemPath, use_mmap) = getsource(string(source), use_mmap)
 function getsource(source, use_mmap)
-    if source isa Vector{UInt8}
-        return source
-    elseif source isa Cmd
-        return Base.read(source)
-    elseif use_mmap && !isa(source, IO)
-        return Mmap.mmap(source)
-    elseif !isa(source, IO)
-        m = Mmap.mmap(source)
-        m2 = Mmap.mmap(Vector{UInt8}, length(m))
-        copyto!(m2, 1, m, 1, length(m))
-        finalize(m)
-        return m2
-    else
-        return slurp(source isa IO ? source : open(String(source)))
+    m = Mmap.mmap(source)
+    if use_mmap
+        return m
     end
+    m2 = Mmap.mmap(Vector{UInt8}, length(m))
+    copyto!(m2, 1, m, 1, length(m))
+    finalize(m)
+    return m2
 end
 
 getname(buf::Vector{UInt8}) = "<raw buffer>"
 getname(cmd::Cmd) = string(cmd)
-getname(str) = String(str)
+getname(str) = string(str)
 getname(io::I) where {I <: IO} = string("<", I, ">")
 
 const RESERVED = Set(["local", "global", "export", "let",
@@ -283,32 +281,31 @@ For advanced usage, you can pass your own `Parsers.Options` type as a keyword ar
 """
 function detect end
 
-function detect(str::String; options=Parsers.OPTIONS)
-    buf = codeunits(str)
-    pos = 1
-    len = sizeof(str)
+detect(str::String; options=Parsers.OPTIONS) = something(detect(codeunits(str), 1, sizeof(str), options), str)
+
+function detect(buf, pos, len, options)
     int, code, vpos, vlen, tlen = Parsers.xparse(Int64, buf, pos, len, options)
     if Parsers.sentinel(code) && code > 0
         return missing
     end
-    if Parsers.ok(code) && vlen == len
+    if Parsers.ok(code) && vpos + vlen - 1 == len
         return int
     end
     float, code, vpos, vlen, tlen = Parsers.xparse(Float64, buf, pos, len, options)
-    if Parsers.ok(code) && vlen == len
+    if Parsers.ok(code) && vpos + vlen - 1 == len
         return float
     end
     if options.dateformat === nothing
         try
             date, code, vpos, vlen, tlen = Parsers.xparse(Date, buf, pos, len, options)
-            if Parsers.ok(code) && vlen == len
+            if Parsers.ok(code) && vpos + vlen - 1 == len
                 return date
             end
         catch e
         end
         try
             datetime, code, vpos, vlen, tlen = Parsers.xparse(DateTime, buf, pos, len, options)
-            if Parsers.ok(code) && vlen == len
+            if Parsers.ok(code) && vpos + vlen - 1 == len
                 return datetime
             end
         catch e
@@ -318,17 +315,17 @@ function detect(str::String; options=Parsers.OPTIONS)
             # use user-provided dateformat
             DT = timetype(options.dateformat)
             dt, code, vpos, vlen, tlen = Parsers.xparse(DT, buf, pos, len, options)
-            if Parsers.ok(code) && vlen == len
+            if Parsers.ok(code) && vpos + vlen - 1 == len
                 return dt
             end
         catch e
         end
     end
     bool, code, vpos, vlen, tlen = Parsers.xparse(Bool, buf, pos, len, options)
-    if Parsers.ok(code) && vlen == len
+    if Parsers.ok(code) && vpos + vlen - 1 == len
         return bool
     end
-    return str
+    return nothing
 end
 
 struct ReversedBuf <: AbstractVector{UInt8}

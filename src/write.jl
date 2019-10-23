@@ -9,7 +9,7 @@ Supported keyword arguments include:
 * `quotechar::Char='"'`: ascii character to use for quoting text fields that may contain delimiters or newlines
 * `openquotechar::Char`: instead of `quotechar`, use `openquotechar` and `closequotechar` to support different starting and ending quote characters
 * `escapechar::Char='"'`: ascii character used to escape quote characters in a text field
-* `missingstring::String=""`: string to print for `missing` values 
+* `missingstring::String=""`: string to print for `missing` values
 * `dateformat=Dates.default_format(T)`: the date format string to use for printing out `Date` & `DateTime` columns
 * `append=false`: whether to append writing to an existing file/IO, if `true`, it will not write column names by default
 * `writeheader=!append`: whether to write an initial row of delimited column names, not written by default if appending
@@ -136,7 +136,7 @@ function with(f::Function, io::Union{Base.TTY, Base.Pipe, Base.PipeEndpoint, Bas
     f(io)
 end
 
-function with(f::Function, file::String, append)
+function with(f::Function, file::Union{AbstractString, AbstractPath}, append)
     open(file, append ? "a" : "w") do io
         f(io)
     end
@@ -322,6 +322,7 @@ function writecell(buf, pos, len, io, x::AbstractString, opts)
 end
 
 function check(bytes, sz, delim::UInt8, oq, cq, newline::UInt8)
+    isempty(bytes) && return false, false
     needtoescape = false
     @inbounds needtoquote = bytes[1] == oq
     @simd for i = 1:sz
